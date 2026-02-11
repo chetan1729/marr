@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data and Logs
+imagenet_shards/
+log/
+*.pt
+*.npz
+
+# Environments
+venv/
+.env
+
+# OS files
+.DS_Store
+

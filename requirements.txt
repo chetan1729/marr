@@ -1,0 +1,24 @@
+# Using the CUDA 12.x+ compute platform for RTX 50-series support
+torch>=2.6.0
+torchvision>=0.21.0
+torchaudio
+
+# Distributed Training & Multi-GPU
+# (Standard in PyTorch, but ensure these are installed for DDP)
+setuptools
+packaging
+
+# Vision Transformer Specifics
+timm>=1.0.0             # For optimized DropPath and ViT components
+numpy>=1.26.0           # Efficient array handling for shards
+pillow>=10.0.0          # Image processing and resizing
+
+# Data Loading & Preprocessing
+huggingface_hub         # To download ImageNet-1k
+datasets                # HF streaming datasets
+tqdm                    # Progress bars for sharding and training
+
+# Utilities
+dataclasses             # (Standard in Python 3.7+, but good to have)
+tiktoken                # (Optional, since we removed the GPT dependency)
+matplotlib              # For plotting loss curves later
