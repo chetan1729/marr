@@ -5,9 +5,9 @@ __pycache__/
 
 # Data and Logs
 imagenet_shards/
-log/
-*.pt
-*.npz
+log/*.pt
+!log/
+*.log
 
 # Environments
 venv/

@@ -16,6 +16,7 @@ import glob
 import torch
 import numpy as np
 from torch.utils.data import IterableDataset, DataLoader
+from streaming import StreamingDataset
 
 
 torch.backends.cudnn.benchmark = True
@@ -42,86 +43,70 @@ class ViTConfig:
     num_patches: int = (224 // 16) ** 2 # 196 + 1 (CLS token) = 197
 
 # -----------------------------------------------------------------------------
+import torch.distributed as dist
+import webdataset as wds
+from datasets import load_dataset
+import torch
+from functools import partial
 
-class ShardedDataset(IterableDataset):
-    def __init__(self, shard_dir, split, ddp_rank, ddp_world_size, shuffle=True):
-        super().__init__()
-        self.shard_dir = shard_dir
-        self.split = split
-        self.ddp_rank = ddp_rank
-        self.ddp_world_size = ddp_world_size
-        self.shuffle = shuffle
+from functools import partial
+
+# 1. Global Scope Functions (Worker Safe)
+def transform_fn(example, transform_op):
+    img = example["jpg"].convert("RGB")
+    example["pixel_values"] = transform_op(img)
+    return example
+
+def global_collate_fn(batch):
+    pixel_values = torch.stack([x["pixel_values"] for x in batch])
+    # Try 'cls' first (timm standard), then 'label' (HF standard)
+    if "cls" in batch[0]:
+        labels = torch.tensor([x["cls"] for x in batch], dtype=torch.long)
+    else:
+        labels = torch.tensor([x["label"] for x in batch], dtype=torch.long)
         
-        self.shards = sorted(glob.glob(os.path.join(shard_dir, f"imagenet_{split}_*.npz")))
-        if not self.shards:
-            raise RuntimeError(f"No shards found for split '{split}' in {shard_dir}")
+    return pixel_values, labels
 
-    def __iter__(self):
-        rank = self.ddp_rank
-        world_size = self.ddp_world_size
-        
-        # If we have very few shards, let everyone use all of them for now
-        if len(self.shards) < world_size:
-            my_shards = self.shards
-        else:
-            my_shards = [s for i, s in enumerate(self.shards) if i % world_size == rank]
-        
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is not None:
-            my_shards = [s for i, s in enumerate(my_shards) if i % worker_info.num_workers == worker_info.id]
-
-        if not my_shards:
-            return
-
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-
-        while True:
-            if self.shuffle:
-                np.random.shuffle(my_shards)
-
-            for shard_path in my_shards:
-                try:
-                    data = np.load(shard_path)
-                    # Fixed the ambiguous truth value error here:
-                    imgs = data['imgs'] if 'imgs' in data else data['images']
-                    labels = data['labels'] if 'labels' in data else data['label']
-                    
-                    indices = np.arange(len(imgs))
-                    if self.shuffle:
-                        np.random.shuffle(indices)
-
-                    for idx in indices:
-                        img = torch.from_numpy(imgs[idx]).permute(2, 0, 1).float() / 255.0
-                        img = (img - mean) / std
-                        label = torch.tensor(labels[idx], dtype=torch.long)
-                        yield img, label
-                except Exception as e:
-                    print(f"Rank {rank} Error: {e}")
-                    continue
-            
-            if self.split == 'val':
-                break
-
-def create_loader(shard_dir, split, B, ddp_rank, ddp_world_size, num_workers=0):
-    ds = ShardedDataset(
-        shard_dir=shard_dir, 
-        split=split, 
-        ddp_rank=ddp_rank, 
-        ddp_world_size=ddp_world_size,
-        shuffle=(split == 'train')
-    )
+def create_loader(split, B, ddp_rank, ddp_world_size, num_workers=8):
+    hf_split = 'validation' if split == 'val' else split
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     
+    if split == 'train':
+        tf_op = transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,
+        ])
+    else:
+        tf_op = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize,
+        ])
+
+    # Streaming setup
+    dataset = load_dataset(
+        "timm/imagenet-1k-wds", 
+        split=hf_split, 
+        streaming=True,
+        cache_dir="/root/hf_cache"
+    )
+
+    # Apply transform via map
+    dataset = dataset.map(partial(transform_fn, transform_op=tf_op))
+
     return DataLoader(
-        ds, 
-        batch_size=B, 
+        dataset.shuffle(5000) if split == 'train' else dataset, 
+        batch_size=B,
         num_workers=num_workers,
+        collate_fn=global_collate_fn, 
         pin_memory=True,
         drop_last=True,
-        # Only use prefetch_factor if num_workers > 0
-        prefetch_factor=2 if num_workers > 0 else None 
+        prefetch_factor=2,
+        persistent_workers=True
     )
-
 
 # Patch Embedding class
 class PatchEmbedding(nn.Module):
@@ -289,9 +274,15 @@ class ViT(nn.Module):
             torch.nn.init.trunc_normal_(module.weight, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, (nn.LayerNorm, nn.Embedding)):
+                
+        elif isinstance(module, nn.LayerNorm):
+            # LayerNorm has both weight and bias
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
+            
+        elif isinstance(module, nn.Embedding):
+            # Embedding ONLY has weight, NO bias
+            torch.nn.init.trunc_normal_(module.weight, std=0.02)
 
     def forward(self, x, targets=None):
         # Input x: (B, 3, 224, 224)
@@ -404,12 +395,14 @@ if master_process:
     print(f"Gradient Accumulation Steps: {grad_accum_steps}")
 
 #####################################################################################
-
 ## DataLoader
-# Initialize Loaders
-train_loader = create_loader("imagenet_shards", "train", B, ddp_rank, ddp_world_size, num_workers=4)
-val_loader = create_loader("imagenet_shards", "val", B, ddp_rank, ddp_world_size, num_workers=4)
+# Initialize Loaders with 10 workers to saturate the 8x RTX 5070s
+train_loader = create_loader("train", B, ddp_rank, ddp_world_size, num_workers=10)
+val_loader = create_loader("val", B, ddp_rank, ddp_world_size, num_workers=10)
+
+# Initialize iterators ONCE before the loop starts
 train_iter = iter(train_loader)
+val_iter = iter(val_loader)
 
 # --- LR & Step Calculations ---
 # ImageNet-1k: 1,281,167 images. 
@@ -444,7 +437,7 @@ model = model.to(memory_format=torch.channels_last)
 use_compile = True
 
 if use_compile:
-    model = torch.compile(model)
+    model = torch.compile(model, mode="default")
 
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -453,9 +446,9 @@ raw_model = model.module if ddp else model
 
 # Optimizer with ViT-specific betas
 optimizer = raw_model.configure_optimizers(
-    weight_decay=0.3, # ViT needs higher weight decay than GPT
+    weight_decay=0.1, 
     learning_rate=max_lr, 
-    betas=(0.9, 0.999), 
+    betas=(0.9, 0.95), 
     device_type=device_type
 )
 
@@ -466,104 +459,146 @@ log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
-for step in range(max_steps):
+# Pre-initialize as a buffer to avoid repeated allocation
+val_loss_accum = torch.zeros(1, device=device)
+
+# --- INITIALIZATION BEFORE LOOP ---
+val_loss_steps = 20
+best_val_loss = float('inf')
+
+###########. RESCUE MODE. ##########
+checkpoint_path = os.path.join(log_dir, "model_10000.pt")
+if os.path.exists(checkpoint_path):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    raw_model.load_state_dict(checkpoint['model'])
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    start_step = checkpoint['step'] + 1
+    
+    # REDUCE max_lr so the schedule stays lower for the rest of the run
+    max_lr = 1e-3  # Dropped from 3e-3 to stabilize the model
+    
+    if master_process:
+        print(f"RESUMING FROM STEP {start_step} | New Max LR: {max_lr}")
+else:
+    start_step = 0
+    if master_process:
+        print("No checkpoint found, starting from scratch.")
+###########. END RESCUE MODE. ##########
+
+for step in range(start_step, max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
     # 1. VALIDATION BLOCK
-    if step % 250 == 0 or last_step:
+    # -------------------------------------------------------------------------
+    if step % 500 == 0 or last_step:
         model.eval()
-        val_iter = iter(val_loader) 
-        # INITIALIZE AS TENSOR ON DEVICE
         val_loss_accum = torch.zeros(1, device=device) 
-        val_loss_steps = 20 
         
         with torch.no_grad():
             for _ in range(val_loss_steps):
                 try:
                     x, y = next(val_iter)
                 except StopIteration:
-                    break 
+                    val_iter = iter(val_loader)
+                    x, y = next(val_iter)
                 
-                x = x.to(device, memory_format=torch.channels_last)
-                y = y.to(device)
+                x = x.to(device, memory_format=torch.channels_last, non_blocking=True)
+                y = y.to(device, non_blocking=True)
                 
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
-                # Ensure we add the tensor, not a float
-                val_loss_accum += loss.detach() / val_loss_steps
+                    logits, loss = model(x, y) 
+                val_loss_accum += loss.detach()
         
-        # Now all_reduce will work because it's a tensor
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         
         if master_process:
-            # Use .item() only when printing/logging
-            print(f"step {step:5d} | validation loss: {val_loss_accum.item():.4f}")
-            
-            # Checkpoint Logic
-            if step > 0 and (step % 8000 == 0 or last_step):
-                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'config': raw_model.config.__dict__,
-                    'step': step,
-                    'val_loss': val_loss_accum.item(),
-                }
-                torch.save(checkpoint, checkpoint_path)
+            avg_val_loss = val_loss_accum.item() / val_loss_steps
+            print(f"step {step:5d} | val {avg_val_loss:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {avg_val_loss:.4f}\n")
 
     # 2. TRAINING BLOCK
+    # -------------------------------------------------------------------------
     model.train()
-    optimizer.zero_grad()
-    loss_accum = torch.zeros(1, device=device)
+    optimizer.zero_grad(set_to_none=True)
+    loss_accum_local = 0.0
     
     for micro_step in range(grad_accum_steps):
-        x, y = next(train_iter)
+        try:
+            x, y = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            x, y = next(train_iter)
 
-        # Optimization: Ensure x is channels_last and on the correct device
-        x = x.to(device, memory_format=torch.channels_last)
-        y = y.to(device)
+        # --- MOVE RESUME DEBUG HERE ---
+        if step == start_step and micro_step == 0 and master_process:
+            print(f"RESUME DEBUG: Batch Labels: {y[:10]}")
+            print(f"RESUME DEBUG: Pixel Mean: {x.mean():.4f}, Std: {x.std():.4f}")
+            # Target Mean ~0, Std ~1
+        # ------------------------------
+
+        x = x.to(device, memory_format=torch.channels_last, non_blocking=True)
+        y = y.to(device, non_blocking=True)
         
-        # DDP Grad Sync Optimization
         if ddp:
+            # Sync gradients only on the final micro-step
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-        
+
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, loss = model(x, y)
+            loss = loss / grad_accum_steps
         
-        # Loss Scaling for Gradient Accumulation
-        loss = loss / grad_accum_steps
-        loss_accum += loss.detach()
         loss.backward()
+        # .item() is crucial to break the CUDAGraph/Autograd reference
+        loss_accum_local += loss.detach().item()
 
-    if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-
-    # Gradient Clipping - Essential for ViT stability
+    # Global Gradient Clipping
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     
-    # LR Schedule Update
+    # Update Learning Rate
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     
     optimizer.step()
     
+    # 3. LOGGING & CHECKPOINTING
+    # -------------------------------------------------------------------------
     if device_type == "cuda":
-        torch.cuda.synchronize() # Critical for accurate timing on 5070s
+        torch.cuda.synchronize() 
     
     t1 = time.time()
-    dt = t1 - t0
-    
-    # Image Throughput Calculation
-    images_processed = total_batch_size # (B * world_size * grad_accum)
-    img_per_sec = images_processed / dt
-    
+    loss_tensor = torch.tensor(loss_accum_local, device=device)
+    if ddp:
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+
     if master_process:
-        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | img/sec: {img_per_sec:.2f}")
+        img_per_sec = total_batch_size / (t1 - t0)
+        print(f"step {step:5d} | loss: {loss_tensor.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {(t1-t0)*1000:.2f}ms | img/sec: {img_per_sec:.2f}")
         with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum.item():.6f}\n")
+            f.write(f"{step} train {loss_tensor.item():.6f}\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Save Checkpoint every 1000 steps or last step
+        if step > 0 and (step % 5000 == 0 or last_step):
+            checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'step': step,
+                'val_loss': avg_val_loss if 'avg_val_loss' in locals() else None,
+            }
+            torch.save(checkpoint, checkpoint_path)
+            # Latest symlink-style save
+            torch.save(checkpoint, os.path.join(log_dir, "latest.pt"))
+            print(f"--- Saved checkpoint at step {step} ---")
+
+    # Final Sync to keep all ranks together
+    if ddp:
+        dist.barrier()
 
 if ddp:
     destroy_process_group()
