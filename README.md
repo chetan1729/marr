@@ -47,7 +47,7 @@ While the model achieved a robust **80.07% Top-5 accuracy**, the Top-1 accuracy 
 
 ---
 
-**## 📈 Next Steps (V2 Objectives)**
+**📈 Next Steps (V2 Objectives)**
 **Scale LR: Increase Learning Rate to 3e-3 to match the 4096 batch size.
 
 Scheduler Tuning: Extend the warmup phase to 10k steps to stabilize high-LR training.
@@ -59,4 +59,5 @@ Regularization Decay: Implement a schedule to reduce Mixup intensity in the fina
 ### Requirements
 ```bash
 pip install torch torchvision timm datasets webdataset tqdm```
+
 
