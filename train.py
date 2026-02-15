@@ -392,175 +392,178 @@ if torch.cuda.is_available():
 ##################################################### DDP SETUP #############################################
 
 ##################################################### TRAINING SETUP #############################################
+def main():
+    total_batch_size = 4096 # Global batch size (images per step)
+    B = 128                  # Micro-batch size (images per GPU per forward pass)
 
-total_batch_size = 4096 # Global batch size (images per step)
-B = 128                  # Micro-batch size (images per GPU per forward pass)
-
-# Calculation:
-# total_batch_size = B * grad_accum_steps * ddp_world_size
-assert total_batch_size % (B * ddp_world_size) == 0, "Total batch size must be divisible by (B * world_size)"
-grad_accum_steps = total_batch_size // (B * ddp_world_size)
-
-if master_process:
-    print(f"Global Batch Size: {total_batch_size}")
-    print(f"Micro Batch Size (B): {B}")
-    print(f"Number of GPUs: {ddp_world_size}")
-    print(f"Gradient Accumulation Steps: {grad_accum_steps}")
-
-#####################################################################################
-
-## DataLoader
-# Initialize Loaders
-train_loader = create_loader("imagenet_shards", "train", B, ddp_rank, ddp_world_size, num_workers=4)
-val_loader = create_loader("imagenet_shards", "val", B, ddp_rank, ddp_world_size, num_workers=4)
-train_iter = iter(train_loader)
-val_iter = iter(val_loader)
-
-# --- LR & Step Calculations ---
-# ImageNet-1k: 1,281,167 images. 
-# Global Batch: 4096. Steps per epoch: ~312
-num_epochs = 300 # 300 epochs to achieve SOTA with ViT-Base on ImageNet-1k dataset
-max_steps = num_epochs * (1281167 // total_batch_size) 
-warmup_steps = 2500 # 10 * (1281167 // total_batch_size) # 10 epochs for warmup
-
-# Learning rate scaling for large batches
-max_lr = 3e-4  
-min_lr = 1e-5 
-
-
-# create the log directory we will write checkpoints to and log to
-log_dir = "log"
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"log_sota.txt")
-with open(log_file, "a") as f: 
-    pass
-
-# Initialize Model with Vision Config
-config = ViTConfig()
-config.process_rank = ddp_rank # So the model knows who is master
-model = ViT(config)
-model.to(device)
-
-# Optimization: Channels Last memory format
-model = model.to(memory_format=torch.channels_last)
-use_compile = True 
-
-if use_compile:
-    model = torch.compile(model, mode="default")
-
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-
-raw_model = model.module if ddp else model
-
-# Optimizer with ViT-specific betas
-optimizer = raw_model.configure_optimizers(
-    weight_decay=0.3, # ViT needs higher weight decay than GPT
-    learning_rate=max_lr, 
-    betas=(0.9, 0.95), 
-    device_type=device_type
-)
-
-# create the log directory we will write checkpoints to and log to
-log_dir = "log"
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"log.txt")
-with open(log_file, "w") as f: # open for writing to clear the file
-    pass
-
-for step in range(max_steps):
-    t0 = time.time()
-    last_step = (step == max_steps - 1)
-
-    # 1. VALIDATION BLOCK
-    if step % 250 == 0 or last_step:
-        model.eval()
-        val_loss_accum = torch.zeros(1, device=device) 
-        
-        with torch.no_grad():
-            for _ in range(val_loss_steps):
-                try:
-                    x, y = next(val_iter)
-                except StopIteration:
-                    val_iter = iter(val_loader)
-                    x, y = next(val_iter)
-                
-                x = x.to(device, memory_format=torch.channels_last, non_blocking=True)
-                y = y.to(device, non_blocking=True)
-                
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x, y) 
-                val_loss_accum += loss.detach()
-        
-        if ddp:
-            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-        
-        if master_process:
-            # Use .item() only when printing/logging
-            print(f"step {step:5d} | validation loss: {val_loss_accum.item():.4f}")
-            
-            # Checkpoint Logic
-            if step > 0 and (step % 8000 == 0 or last_step):
-                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'config': raw_model.config.__dict__,
-                    'step': step,
-                    'val_loss': val_loss_accum.item(),
-                }
-                torch.save(checkpoint, checkpoint_path)
-
-    # 2. TRAINING BLOCK
-    model.train()
-    optimizer.zero_grad(set_to_none=True)
-    loss_accum_local = 0.0
-    
-    for micro_step in range(grad_accum_steps):
-        try:
-            x, y = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            x, y = next(train_iter)
-
-        # Optimization: Ensure x is channels_last and on the correct device
-        x = x.to(device, memory_format=torch.channels_last)
-        y = y.to(device)
-        
-        # DDP Grad Sync Optimization
-        if ddp:
-            # Sync gradients only on the final micro-step
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        
-        loss.backward()
-
-    # Global Gradient Clipping
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    
-    # Update Learning Rate
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    
-    optimizer.step()
-    
-    if device_type == "cuda":
-        torch.cuda.synchronize() 
-    
-    t1 = time.time()
-    loss_tensor = torch.tensor(loss_accum_local, device=device)
-    if ddp:
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+    # Calculation:
+    # total_batch_size = B * grad_accum_steps * ddp_world_size
+    assert total_batch_size % (B * ddp_world_size) == 0, "Total batch size must be divisible by (B * world_size)"
+    grad_accum_steps = total_batch_size // (B * ddp_world_size)
 
     if master_process:
-        img_per_sec = total_batch_size / (t1 - t0)
-        print(f"step {step:5d} | loss: {loss_tensor.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {(t1-t0)*1000:.2f}ms | img/sec: {img_per_sec:.2f}")
-        with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum.item():.6f}\n")
+        print(f"Global Batch Size: {total_batch_size}")
+        print(f"Micro Batch Size (B): {B}")
+        print(f"Number of GPUs: {ddp_world_size}")
+        print(f"Gradient Accumulation Steps: {grad_accum_steps}")
 
-if ddp:
-    destroy_process_group()
+    #####################################################################################
+
+    ## DataLoader
+    # Initialize Loaders
+    train_loader = create_loader("imagenet_shards", "train", B, ddp_rank, ddp_world_size, num_workers=4)
+    val_loader = create_loader("imagenet_shards", "val", B, ddp_rank, ddp_world_size, num_workers=4)
+    train_iter = iter(train_loader)
+    val_iter = iter(val_loader)
+
+    # --- LR & Step Calculations ---
+    # ImageNet-1k: 1,281,167 images. 
+    # Global Batch: 4096. Steps per epoch: ~312
+    num_epochs = 300 # 300 epochs to achieve SOTA with ViT-Base on ImageNet-1k dataset
+    max_steps = num_epochs * (1281167 // total_batch_size) 
+    warmup_steps = 2500 # 10 * (1281167 // total_batch_size) # 10 epochs for warmup
+
+    # Learning rate scaling for large batches
+    max_lr = 3e-4  
+    min_lr = 1e-5 
+
+
+    # create the log directory we will write checkpoints to and log to
+    log_dir = "log"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"log_sota.txt")
+    with open(log_file, "a") as f: 
+        pass
+
+    # Initialize Model with Vision Config
+    config = ViTConfig()
+    config.process_rank = ddp_rank # So the model knows who is master
+    model = ViT(config)
+    model.to(device)
+
+    # Optimization: Channels Last memory format
+    model = model.to(memory_format=torch.channels_last)
+    use_compile = True 
+
+    if use_compile:
+        model = torch.compile(model, mode="default")
+
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+
+    raw_model = model.module if ddp else model
+
+    # Optimizer with ViT-specific betas
+    optimizer = raw_model.configure_optimizers(
+        weight_decay=0.3, # ViT needs higher weight decay than GPT
+        learning_rate=max_lr, 
+        betas=(0.9, 0.95), 
+        device_type=device_type
+    )
+
+    # create the log directory we will write checkpoints to and log to
+    log_dir = "log"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"log.txt")
+    with open(log_file, "w") as f: # open for writing to clear the file
+        pass
+
+    for step in range(max_steps):
+        t0 = time.time()
+        last_step = (step == max_steps - 1)
+
+        # 1. VALIDATION BLOCK
+        if step % 250 == 0 or last_step:
+            model.eval()
+            val_loss_accum = torch.zeros(1, device=device) 
+            
+            with torch.no_grad():
+                for _ in range(val_loss_steps):
+                    try:
+                        x, y = next(val_iter)
+                    except StopIteration:
+                        val_iter = iter(val_loader)
+                        x, y = next(val_iter)
+                    
+                    x = x.to(device, memory_format=torch.channels_last, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
+                    
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                        logits, loss = model(x, y) 
+                    val_loss_accum += loss.detach()
+            
+            if ddp:
+                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+            
+            if master_process:
+                # Use .item() only when printing/logging
+                print(f"step {step:5d} | validation loss: {val_loss_accum.item():.4f}")
+                
+                # Checkpoint Logic
+                if step > 0 and (step % 8000 == 0 or last_step):
+                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'config': raw_model.config.__dict__,
+                        'step': step,
+                        'val_loss': val_loss_accum.item(),
+                    }
+                    torch.save(checkpoint, checkpoint_path)
+
+        # 2. TRAINING BLOCK
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        loss_accum_local = 0.0
+        
+        for micro_step in range(grad_accum_steps):
+            try:
+                x, y = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                x, y = next(train_iter)
+
+            # Optimization: Ensure x is channels_last and on the correct device
+            x = x.to(device, memory_format=torch.channels_last)
+            y = y.to(device)
+            
+            # DDP Grad Sync Optimization
+            if ddp:
+                # Sync gradients only on the final micro-step
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+            
+            loss.backward()
+
+        # Global Gradient Clipping
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
+        # Update Learning Rate
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        
+        optimizer.step()
+        
+        if device_type == "cuda":
+            torch.cuda.synchronize() 
+        
+        t1 = time.time()
+        loss_tensor = torch.tensor(loss_accum_local, device=device)
+        if ddp:
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+
+        if master_process:
+            img_per_sec = total_batch_size / (t1 - t0)
+            print(f"step {step:5d} | loss: {loss_tensor.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {(t1-t0)*1000:.2f}ms | img/sec: {img_per_sec:.2f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} train {loss_accum.item():.6f}\n")
+
+    if ddp:
+        destroy_process_group()
 ##################################################### END TRAINING #############################################
+
+if __name__ == "__main__":
+    main()
