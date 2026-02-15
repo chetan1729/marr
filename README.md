@@ -59,7 +59,8 @@ Regularization Decay: Implement a schedule to reduce Mixup intensity in the fina
 
 ### Requirements
 ```bash
-pip install torch torchvision timm datasets webdataset tqdm```
+pip install torch torchvision timm datasets webdataset tqdm
+
 
 
 
