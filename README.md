@@ -2,7 +2,7 @@
 
 This repository documents the full 300-epoch training run of a **Vision Transformer (ViT-Base)**. The project utilized high-throughput streaming via WebDataset and implemented a heavy-regularization SOTA recipe (Mixup + Stochastic Depth).
 
-## 📊 Final Results (300 Epochs)
+## 📊 Final Results (340 Epochs)
 
 The training completed a full cycle of **435.2 million image exposures** over 106,000 steps with a global batch size of 4096.
 
