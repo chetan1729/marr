@@ -4,11 +4,11 @@ This repository documents the full 300-epoch training run of a **Vision Transfor
 
 ## 📊 Final Results (300 Epochs)
 
-The training completed a full cycle of **384.3 million image exposures** over 93,599 steps with a global batch size of 4096.
+The training completed a full cycle of **435.2 million image exposures** over 106,000 steps with a global batch size of 4096.
 
 | Metric | Final Value | status |
 | :--- | :--- | :--- |
-| **Total Images Seen** | 384,350,100 | 100% Complete |
+| **Total Images Seen** | 435,216,025 | 100% Complete |
 | **Top-1 Accuracy** | **67.01%** | Final |
 | **Top-5 Accuracy** | **80.07%** | Final |
 | **Final Val Loss** | **1.85** | Final |
