@@ -20,7 +20,7 @@ def run_validation():
     model = ViT(config)
     
     # 3. Load Checkpoint
-    checkpoint_path = "log/model_sota_93599.pt" # Update to your specific step
+    checkpoint_path = "checkpoints/phase1/model_sota_93599.pt" # Update to your specific step
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
         # Handle torch.compile/DDP prefixing
@@ -44,7 +44,7 @@ def run_validation():
         normalize,
     ])
 
-    files = "/mnt/ramdisk/imagenet/imagenet1k-validation-*.tar"
+    files = "/dev/shm/imagenet_val/imagenet1k-validation-*.tar"
     dataset = load_dataset("webdataset", data_files=files, split="train", streaming=True)
     
     # Apply identical transform logic

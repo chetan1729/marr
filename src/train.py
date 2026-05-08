@@ -24,35 +24,6 @@ import logging
 logging.getLogger("PIL").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, module="PIL.TiffImagePlugin")
 
-class SOTAAug:
-    def __init__(self, mixup_alpha=0.8):
-        # alpha=0.8 is the gold standard for ViT-Base
-        self.alpha = mixup_alpha
-
-    def __call__(self, x, y):
-        """
-        x: batch of images [B, 3, 224, 224]
-        y: batch of labels [B]
-        """
-        # 1. Determine the 'mix' ratio from a Beta distribution
-        lam = np.random.beta(self.alpha, self.alpha)
-        
-        # 2. Shuffle the batch to find "partners" for each image
-        batch_size = x.size()[0]
-        index = torch.randperm(batch_size).to(x.device)
-        
-        # 3. Create the mixed images
-        # e.g., MixedImage = 0.8 * ImageA + 0.2 * ImageB
-        mixed_x = lam * x + (1 - lam) * x[index, :]
-        
-        # 4. Return the new images, both original labels, and the ratio
-        y_a, y_b = y, y[index]
-        return mixed_x, y_a, y_b, lam
-
-# Initialize it once globally
-sota_aug = SOTAAug()
-
-
 torch.backends.cudnn.benchmark = True
 ##################################################### CONFIG #############################################
 ## Config 
@@ -64,16 +35,16 @@ class ViTConfig:
     n_embd: int = 768       # 768 hidden dim for ViT-Base
     
     # Vision Specifics
-    img_size: int = 224     # Input resolution
+    img_size: int = 256 #224     # Input resolution
     patch_size: int = 16    # 16x16 patches
     num_channels: int = 3   # RGB
     num_classes: int = 1000 # ImageNet-1k
 
-    dropout: float = 0.1
-    drop_path_rate: float = 0.2 # Stochastic Depth rate
+    dropout: float = 0.05
+    drop_path_rate: float = 0.1 # Stochastic Depth rate
     
     # Derived (for internal use)
-    num_patches: int = (224 // 16) ** 2 # 196 + 1 (CLS token) = 197
+    num_patches: int = (256 // 16) ** 2 #(224 // 16) ** 2 # 196 + 1 (CLS token) = 197
 
 # -----------------------------------------------------------------------------
 
@@ -96,54 +67,56 @@ def global_collate_fn(batch):
         
     return pixel_values, labels
 
-def create_loader(split, B, ddp_rank, ddp_world_size, num_workers=8):
-    hf_split = 'validation' if split == 'val' else split
+def wds_transform_fn(sample, transform_op):
+    # webdataset samples are dicts of { "jpg": PIL Image, "cls": label, ... }
+    # when using .decode("pil")
+    img = sample["jpg"].convert("RGB")
+    label = sample["cls"]
+    return transform_op(img), label
+
+def create_loader(split, B, ddp_rank, ddp_world_size, num_workers=64):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     
     if split == 'train':
         tf_op = transforms.Compose([
-            transforms.RandomResizedCrop(224),
+            transforms.RandomResizedCrop(256),
             transforms.RandomHorizontalFlip(),
+            transforms.RandAugment(num_ops=2, magnitude=3),
             transforms.ToTensor(),
             normalize,
         ])
+        files = "/workspace/marr/imagenet_train/imagenet1k-train-*.tar"
     else:
         tf_op = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
+            transforms.Resize(288),
+            transforms.CenterCrop(256),
             transforms.ToTensor(),
             normalize,
         ])
+        files = "/workspace/marr/imagenet_val/imagenet1k-validation-*.tar"
+
+    # Use raw webdataset for maximum speed
+    import glob
+    file_list = sorted(glob.glob(files))
+    
+    # Sharding for DDP
+    file_list = file_list[ddp_rank::ddp_world_size]
+    
+    dataset = wds.WebDataset(file_list, shardshuffle=True if split == 'train' else False)
     
     if split == 'train':
-        files = "/mnt/ramdisk/imagenet/imagenet1k-train-*.tar"
-    else:
-        files = "/mnt/ramdisk/imagenet/imagenet1k-validation-*.tar"
-
-    # Streaming setup
-    dataset = load_dataset(
-        "webdataset", 
-        data_files=files,
-        split="train",  
-        streaming=True
-    )
-
-    dataset = dataset.shard(num_shards=ddp_world_size, index=ddp_rank)
-
-    # Apply transform via map
-    dataset = dataset.map(
-                          partial(transform_fn, transform_op=tf_op),
-                          batched=False, 
-                          )
-
+        dataset = dataset.shuffle(5000)
+    
+    dataset = dataset.decode("pil").map(partial(wds_transform_fn, transform_op=tf_op))
+    
+    # DataLoader with wds
     return DataLoader(
-        dataset.shuffle(5000) if split == 'train' else dataset, 
-        batch_size=B,
-        num_workers=num_workers,
-        collate_fn=global_collate_fn, 
+        dataset, 
+        batch_size=512,
+        num_workers=16,       # Reduced from 64
         pin_memory=True,
         drop_last=True,
-        prefetch_factor=2,
+        prefetch_factor=2,    # Reduced from 4
         persistent_workers=True
     )
 ##################################################### END DATALOADER #############################################
@@ -421,7 +394,7 @@ if torch.cuda.is_available():
 ##################################################### TRAINING SETUP #############################################
 def main():
     total_batch_size = 4096 # Global batch size (images per step)
-    B = 128                  # Micro-batch size (images per GPU per forward pass)
+    B = 1024                  # Micro-batch size (images per GPU per forward pass)
 
     # Calculation:
     # total_batch_size = B * grad_accum_steps * ddp_world_size
@@ -435,8 +408,8 @@ def main():
         print(f"Gradient Accumulation Steps: {grad_accum_steps}")
 
     ## DATALOADERS ***************************************************************************
-    train_loader = create_loader("train", B, ddp_rank, ddp_world_size, num_workers=4)
-    val_loader = create_loader("val", B, ddp_rank, ddp_world_size, num_workers=4)
+    train_loader = create_loader("train", B, ddp_rank, ddp_world_size, num_workers=32)
+    val_loader = create_loader("val", B, ddp_rank, ddp_world_size, num_workers=32)
     #******************************************************************************************
 
     # Initialize iterators ONCE before the loop starts
@@ -446,19 +419,18 @@ def main():
     # --- LR & Step Calculations ---
     # ImageNet-1k: 1,281,167 images. 
     # Global Batch: 4096. Steps per epoch: ~312
-    num_epochs = 300 # 300 epochs to achieve SOTA with ViT-Base on ImageNet-1k dataset
-    max_steps = num_epochs * (1281167 // total_batch_size) 
-    warmup_steps = 2500 # 10 * (1281167 // total_batch_size) # 10 epochs for warmup
+    num_epochs = 5
+    steps_per_epoch = 1281167 // total_batch_size
 
     # Learning rate scaling for large batches
-    max_lr = 3e-4  
-    min_lr = 1e-5 
+    max_lr = 2e-5  
+    min_lr = 5e-7 
 
 
     # create the log directory we will write checkpoints to and log to
     log_dir = "log"
     os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"log_sota.txt")
+    log_file = os.path.join(log_dir, f"phase_2/log_sota_v2.txt")
     with open(log_file, "a") as f: 
         pass
 
@@ -482,30 +454,30 @@ def main():
 
     # Optimizer with ViT-specific betas
     optimizer = raw_model.configure_optimizers(
-        weight_decay=0.05, 
+        weight_decay=0.1, 
         learning_rate=max_lr, 
         betas=(0.9, 0.999), 
         device_type=device_type
     )
 
 
-    checkpoint_path = os.path.join(log_dir, "model_sota_30000.pt")
+    checkpoint_path = "log/model_sota_106000.pt"
     if os.path.exists(checkpoint_path):
         # map_location ensures we don't leak VRAM on rank 0 during load
         checkpoint = torch.load(checkpoint_path, map_location=device)
         state_dict = checkpoint['model']
-        
+
         # 1. Get the keys currently inside your model (which might have _orig_mod)
         model_state = raw_model.state_dict()
         model_keys = list(model_state.keys())
-        
+
         # 2. Create a "Translation Map": { "clean_name": "actual_model_name" }
         # Example: { "head.weight": "_orig_mod.head.weight" }
         clean_to_model = {
             k.replace('_orig_mod.', '').replace('module.', ''): k 
             for k in model_keys
         }
-        
+
         # 3. Build the new state dict by matching clean names
         new_state_dict = {}
         for k, v in state_dict.items():
@@ -517,7 +489,32 @@ def main():
                 if master_process:
                     print(f"WARNING: Key {clean_key} not found in model architecture!")
 
-        # 4. Load with strict=True. If this fails, the model architecture is different.
+        # --- THE FIX: Interpolate on new_state_dict directly ---
+        pos_key = next((k for k in new_state_dict.keys() if 'pos_embed' in k), None)
+
+        if pos_key:
+            pos_embed_checkpoint = new_state_dict[pos_key]
+            embedding_dim = pos_embed_checkpoint.shape[-1]
+            orig_size = int(math.sqrt(pos_embed_checkpoint.shape[1] - 1)) # 14
+            new_size = config.img_size // config.patch_size # 16
+
+            if orig_size != new_size:
+                if master_process:
+                    print(f"Interpolating {pos_key} from {orig_size}x{orig_size} to {new_size}x{new_size}...")
+                
+                cls_token = pos_embed_checkpoint[:, :1, :]
+                spatial_tokens = pos_embed_checkpoint[:, 1:, :]
+                
+                spatial_tokens = spatial_tokens.reshape(1, orig_size, orig_size, embedding_dim).permute(0, 3, 1, 2)
+                spatial_tokens = torch.nn.functional.interpolate(
+                    spatial_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False
+                )
+                spatial_tokens = spatial_tokens.permute(0, 2, 3, 1).flatten(1, 2)
+                
+                # Assign the interpolated version back to new_state_dict
+                new_state_dict[pos_key] = torch.cat((cls_token, spatial_tokens), dim=1)
+
+        # 4. Now load the interpolated dict
         raw_model.load_state_dict(new_state_dict, strict=True)
 
         if 'optimizer' in checkpoint:
@@ -528,28 +525,32 @@ def main():
             # log putting
             print(f"SOTA SPRINT: Weights successfully mapped (File -> Model).")
             print(f"Resuming from step {start_step}. Total tensors loaded: {len(new_state_dict)}")
+    
     else:
         start_step = 0
         if master_process:
             # log putting
             print("No checkpoint found, starting from scratch.")
 
+    # Calculate steps relative to start_step
+    warmup_steps = start_step + (2 * steps_per_epoch)
+    max_steps = start_step + (num_epochs * steps_per_epoch)
+
     def get_lr(it):
-        # 1. Linear Warmup (Global)
+        # 1. Linear Warmup (relative to start_step)
         if it < warmup_steps:
-            return max_lr * (it + 1) / warmup_steps
-        
+            progress = (it - start_step + 1) / (warmup_steps - start_step)
+            return max_lr * progress
+
         # 2. Beyond Max Steps
         if it > max_steps: 
             return min_lr
-        
-        # 3. Cosine Decay (The main training phase)
-        # This calculates where we are in the journey from 2,500 to max_steps
+
+        # 3. Cosine Decay 
         decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
         coeff = 0.5 * (1.0 + math.cos(math.pi * max(0, min(1, decay_ratio))))
-        
-        return min_lr + coeff * (max_lr - min_lr)
 
+        return min_lr + coeff * (max_lr - min_lr)
     torch.set_float32_matmul_precision('high') # Good for TF32 on GPUs
 
     # Pre-initialize as a buffer to avoid repeated allocation
@@ -566,10 +567,10 @@ def main():
         last_step = (step == max_steps - 1)
 
         # Validation Block (Every 500 steps or on the last step)
-        # -------------------------------------------------------------------------
         if step % 500 == 0 or last_step:
             model.eval()
-            val_loss_accum = torch.zeros(1, device=device) 
+            val_loss_accum = torch.zeros(1, device=device)
+            val_acc_accum = torch.zeros(1, device=device) # Track correct predictions
             
             with torch.no_grad():
                 for _ in range(val_loss_steps):
@@ -583,17 +584,23 @@ def main():
                     y = y.to(device, non_blocking=True)
                     
                     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss = model(x, y) 
+                        logits, loss = model(x, y)
+                    
                     val_loss_accum += loss.detach()
+                    # Calculate Accuracy
+                    preds = logits.argmax(dim=-1)
+                    val_acc_accum += (preds == y).float().mean()
             
             if ddp:
                 dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+                dist.all_reduce(val_acc_accum, op=dist.ReduceOp.AVG)
             
             if master_process:
                 avg_val_loss = val_loss_accum.item() / val_loss_steps
-                print(f"step {step:5d} | val {avg_val_loss:.4f}")
+                avg_val_acc = (val_acc_accum.item() / val_loss_steps) * 100
+                print(f"step {step:5d} | val_loss {avg_val_loss:.4f} | val_acc {avg_val_acc:.2f}%")
                 with open(log_file, "a") as f:
-                    f.write(f"{step} val {avg_val_loss:.4f}\n")
+                    f.write(f"{step} val_loss {avg_val_loss:.4f} val_acc {avg_val_acc:.2f}\n")
 
         # Training Block
         # -------------------------------------------------------------------------
@@ -602,6 +609,7 @@ def main():
         loss_accum_local = 0.0
         
         for micro_step in range(grad_accum_steps):
+            
             try:
                 x, y = next(train_iter)
             except StopIteration:
@@ -611,17 +619,14 @@ def main():
             x = x.to(device, memory_format=torch.channels_last, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-            # Apply this after fetching the clean data from the stream
-            x, y_a, y_b, lam = sota_aug(x, y)
-            
             if ddp:
                 # Sync gradients only on the final micro-step
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
 
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                # Mixed Loss: Comparing predictions against both labels
+                # Standard Cross Entropy Loss (Mixup disabled)
                 logits, _ = model(x)
-                loss = (lam * F.cross_entropy(logits, y_a) + (1 - lam) * F.cross_entropy(logits, y_b))
+                loss = F.cross_entropy(logits, y, label_smoothing=0.1)
                 loss = loss / grad_accum_steps
             
             loss.backward()
@@ -656,7 +661,7 @@ def main():
                 os.fsync(f.fileno())
 
             # Save Checkpoint every 1000 steps or last step
-            if step > 0 and (step % 5000 == 0 or last_step):
+            if step > 0 and (step % 1000 == 0 or last_step):
                 checkpoint_path = os.path.join(log_dir, f"model_sota_{step:05d}.pt")
                 checkpoint = {
                     'model': raw_model.state_dict(),

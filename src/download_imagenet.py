@@ -1,40 +1,44 @@
 import os
 import subprocess
 
+from huggingface_hub import snapshot_download
+
 def download_dataset():
-    local_dir = "/mnt/ramdisk/imagenet"
+    train_dir = "/workspace/marr/imagenet_train"
+    val_dir = "/dev/shm/imagenet_val"
     repo_id = "timm/imagenet-1k-wds"
     
-    # 1. Ensure the RAM disk directory exists
-    print(f"--- Preparing {local_dir} ---")
-    os.makedirs(local_dir, exist_ok=True)
+    # 1. Ensure directories exist
+    os.makedirs(train_dir, exist_ok=True)
+    os.makedirs(val_dir, exist_ok=True)
     
-    # 2. Build the command
-    # We use 32 workers for speed and disable symlinks to force data into RAM
-    cmd = [
-        "huggingface-cli", "download", repo_id,
-        "--repo-type", "dataset",
-        "--local-dir", local_dir,
-        "--local-dir-use-symlinks", "False",
-        "--max-workers", "32"
-    ]
+    # 2. Download Validation Set (to RAM)
+    print(f"--- Downloading Validation Set to {val_dir} ---")
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        local_dir=val_dir,
+        allow_patterns="imagenet1k-validation-*.tar",
+        token=os.getenv("HF_TOKEN")
+    )
     
-    print(f"--- Starting Download: {repo_id} ---")
-    try:
-        subprocess.run(cmd, check=True)
-        print("\nDownload Complete!")
-    except subprocess.CalledProcessError as e:
-        print(f"\nDownload failed with error: {e}")
-        return
+    # 3. Download Training Set (to Disk)
+    print(f"--- Downloading Training Set to {train_dir} ---")
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        local_dir=train_dir,
+        allow_patterns="imagenet1k-train-*.tar",
+        max_workers=32,
+        token=os.getenv("HF_TOKEN")
+    )
 
-    # 3. Final Verification
-    print("--- Verifying Data Size ---")
-    size_cmd = subprocess.run(["du", "-sh", local_dir], capture_output=True, text=True)
-    print(f"Total Size on RAM Disk: {size_cmd.stdout.strip()}")
-    
-    # 4. Check for .tar shards
-    train_count = len([f for f in os.listdir(f"{local_dir}/train") if f.endswith('.tar')])
-    print(f"Detected {train_count} shards in train folder.")
+    # 4. Final Verification
+    print("--- Verifying Shards ---")
+    train_count = len([f for f in os.listdir(train_dir) if f.endswith('.tar')])
+    val_count = len([f for f in os.listdir(val_dir) if f.endswith('.tar')])
+    print(f"Train Shards: {train_count}")
+    print(f"Val Shards: {val_count}")
 
 if __name__ == "__main__":
     download_dataset()
