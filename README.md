@@ -9,7 +9,7 @@ The training completed a full cycle of **384.3 million image exposures** over 93
 | Metric | Final Value | status |
 | :--- | :--- | :--- |
 | **Total Images Seen** | 384,350,100 | 100% Complete |
-| **Top-1 Accuracy** | **57.28%** | Final |
+| **Top-1 Accuracy** | **67.01%** | Final |
 | **Top-5 Accuracy** | **80.07%** | Final |
 | **Final Val Loss** | **1.85** | Final |
 
