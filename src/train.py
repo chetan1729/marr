@@ -14,7 +14,6 @@ from tqdm import tqdm
 from timm.layers import DropPath
 import glob
 from torch.utils.data import IterableDataset, DataLoader
-from streaming import StreamingDataset
 from functools import partial
 from datasets import load_dataset
 import webdataset as wds
@@ -81,7 +80,7 @@ def create_loader(split, B, ddp_rank, ddp_world_size, num_workers=64):
         tf_op = transforms.Compose([
             transforms.RandomResizedCrop(256),
             transforms.RandomHorizontalFlip(),
-            transforms.RandAugment(num_ops=2, magnitude=3),
+            #transforms.RandAugment(num_ops=2, magnitude=3), # Disabling rand Aug in last phase for seeing moder performance
             transforms.ToTensor(),
             normalize,
         ])

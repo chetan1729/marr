@@ -5,7 +5,7 @@ from huggingface_hub import snapshot_download
 
 def download_dataset():
     train_dir = "/workspace/marr/imagenet_train"
-    val_dir = "/dev/shm/imagenet_val"
+    val_dir = "//workspace/marr/imagenet_val"
     repo_id = "timm/imagenet-1k-wds"
     
     # 1. Ensure directories exist

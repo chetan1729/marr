@@ -6,7 +6,6 @@ __pycache__/
 # Data and Logs
 imagenet_shards/
 log/*.pt
-!log/
 
 
 # Environments
